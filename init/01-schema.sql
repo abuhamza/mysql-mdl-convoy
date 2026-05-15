@@ -36,8 +36,12 @@ INSERT INTO sensor_data (sensor_id, ts, payload) VALUES
     (1, '2026-05-15 12:00:00', 'seed-p3'),
     (1, '2026-06-15 12:00:00', 'seed-p4');
 
--- Grant the demo user access to performance_schema so the monitor can run as `demo`.
-GRANT SELECT ON performance_schema.* TO 'demo'@'%';
-GRANT SELECT ON sys.* TO 'demo'@'%';
-GRANT PROCESS ON *.* TO 'demo'@'%';
+-- Grant the demo user what the monitor needs:
+--   * SELECT on performance_schema for metadata_locks / threads
+--   * PROCESS so threads from other connections are visible
+-- We deliberately avoid sys.* views: their definer/invoker rules trip up
+-- non-root users with error 1356, and the monitor derives wait edges from
+-- the raw performance_schema tables instead.
+GRANT SELECT  ON performance_schema.* TO 'demo'@'%';
+GRANT PROCESS ON *.*                  TO 'demo'@'%';
 FLUSH PRIVILEGES;

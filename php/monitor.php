@@ -39,14 +39,32 @@ SELECT  mdl.OBJECT_SCHEMA   AS db,
  ORDER BY (mdl.LOCK_STATUS = 'GRANTED') DESC, mdl.OWNER_THREAD_ID
 SQL;
 
+// Derive wait edges directly from performance_schema.metadata_locks so we don't
+// depend on `sys.schema_table_lock_waits` (whose definer-rights checks fail for
+// non-root users). For each PENDING request we list every GRANTED holder on the
+// same table — a superset of the true wait graph that's accurate enough for the
+// convoy demo.
 $waitsSql = <<<SQL
-SELECT  waiting_pid       AS waiter_conn,
-        waiting_query     AS waiter_sql,
-        blocking_pid      AS blocker_conn,
-        sql_kill_blocking_query AS kill_hint
-  FROM  sys.schema_table_lock_waits
- WHERE  object_schema = DATABASE()
-   AND  object_name   = :tbl
+SELECT  pt.PROCESSLIST_ID                            AS waiter_conn,
+        SUBSTRING(pt.PROCESSLIST_INFO, 1, 80)        AS waiter_sql,
+        gt.PROCESSLIST_ID                            AS blocker_conn,
+        SUBSTRING(gt.PROCESSLIST_INFO, 1, 80)        AS blocker_sql,
+        p.LOCK_TYPE                                  AS waiter_lock,
+        g.LOCK_TYPE                                  AS blocker_lock
+  FROM  performance_schema.metadata_locks p
+  JOIN  performance_schema.threads pt ON pt.THREAD_ID = p.OWNER_THREAD_ID
+  JOIN  performance_schema.metadata_locks g
+        ON g.OBJECT_TYPE     = p.OBJECT_TYPE
+       AND g.OBJECT_SCHEMA   = p.OBJECT_SCHEMA
+       AND g.OBJECT_NAME     = p.OBJECT_NAME
+       AND g.LOCK_STATUS     = 'GRANTED'
+       AND g.OWNER_THREAD_ID <> p.OWNER_THREAD_ID
+  JOIN  performance_schema.threads gt ON gt.THREAD_ID = g.OWNER_THREAD_ID
+ WHERE  p.OBJECT_TYPE   = 'TABLE'
+   AND  p.OBJECT_SCHEMA = DATABASE()
+   AND  p.OBJECT_NAME   = :tbl
+   AND  p.LOCK_STATUS   = 'PENDING'
+ ORDER BY pt.PROCESSLIST_ID, gt.PROCESSLIST_ID
 SQL;
 
 $locks = $pdo->prepare($locksSql);
@@ -94,11 +112,13 @@ function print_block(int $tick, array $locks, array $waits): void {
     }
 
     if ($waits) {
-        echo "\nWAIT EDGES (sys.schema_table_lock_waits):\n";
+        echo "\nWAIT EDGES (derived from performance_schema.metadata_locks):\n";
         foreach ($waits as $w) {
-            printf("  conn %s  <--blocked-by--  conn %s   (waiter: %s)\n",
-                $w['waiter_conn'] ?? '?',
+            printf("  conn %s [%s]  <--blocked-by--  conn %s [%s]   (waiter: %s)\n",
+                $w['waiter_conn']  ?? '?',
+                $w['waiter_lock']  ?? '?',
                 $w['blocker_conn'] ?? '?',
+                $w['blocker_lock'] ?? '?',
                 substr((string)($w['waiter_sql'] ?? ''), 0, 70));
         }
     }

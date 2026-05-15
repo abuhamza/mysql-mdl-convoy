@@ -101,9 +101,10 @@ CONN  THR   LOCK_TYPE            DURATION    STATUS    ...
 13    74    EXCLUSIVE            TRANSACTION PENDING   [WAITS]
 14    75    SHARED_WRITE         TRANSACTION PENDING   [WAITS]
 
-WAIT EDGES (sys.schema_table_lock_waits):
-  conn 13  <--blocked-by--  conn 12   (waiter: ALTER TABLE sensor_data TRUNCATE PARTITION p2)
-  conn 14  <--blocked-by--  conn 13   (waiter: INSERT INTO sensor_data ...)
+WAIT EDGES (derived from performance_schema.metadata_locks):
+  conn 13 [EXCLUSIVE]    <--blocked-by--  conn 12 [SHARED_WRITE]   (waiter: ALTER TABLE sensor_data TRUNCATE PARTITION p2)
+  conn 14 [SHARED_WRITE] <--blocked-by--  conn 13 [EXCLUSIVE]      (waiter: INSERT INTO sensor_data ...)
+  conn 14 [SHARED_WRITE] <--blocked-by--  conn 12 [SHARED_WRITE]   (waiter: INSERT INTO sensor_data ...)
 ```
 
 That third row is the punchline: **Actor C is blocked by Actor B, not by
@@ -132,8 +133,14 @@ should see Actor B took ~60s and Actor C took ~60s as well, even though both
    The `command:` block in `docker-compose.yml` also passes
    `--performance-schema-instrument='wait/lock/metadata/sql/mdl=ON'` so the
    instrument is armed at server start, before any session connects.
-2. Grants the `demo` user `SELECT` on `performance_schema` / `sys` and
-   `PROCESS` globally so `monitor.php` can run as a non-root user.
+2. Grants the `demo` user `SELECT` on `performance_schema` and `PROCESS`
+   globally so `monitor.php` can see threads from other connections.
+
+The monitor deliberately does **not** use `sys.schema_table_lock_waits` —
+that view's definer/invoker checks fail with `ERROR 1356` for non-root users
+in a stock MySQL 8.0 image. Instead the wait edges are derived directly from
+`performance_schema.metadata_locks` by joining each `PENDING` row to every
+`GRANTED` row on the same object.
 
 ## Tearing it down
 
@@ -150,9 +157,8 @@ script from scratch.
   you breathing room to watch the convoy form. Bump the `holder`'s sleep
   argument if you want a longer window: `php mdl_actor.php holder 180`.
 - If Actor B times out before Actor A commits, you'll see
-  `ERROR 1205 (HY000): Lock wait timeout exceeded`. That's the kill-hint
-  emitted by `sys.schema_table_lock_waits.sql_kill_blocking_query` — the
-  monitor prints the connection ids so you can kill the holder by hand if
-  you'd rather not wait.
+  `ERROR 1205 (HY000): Lock wait timeout exceeded`. The monitor prints the
+  connection ids of the holder and the waiter, so you can `KILL <conn_id>`
+  the holder by hand if you'd rather not wait for the timeout.
 - The `php` container runs `tail -f /dev/null` after installing `pdo_mysql`;
   all PHP commands go through `docker compose exec php ...`.
