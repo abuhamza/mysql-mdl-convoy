@@ -1,0 +1,54 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mdl-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: mdl_demo
+      MYSQL_USER: demo
+      MYSQL_PASSWORD: demopw
+    command:
+      - --performance_schema=ON
+      - --performance-schema-instrument=wait/lock/metadata/sql/mdl=ON
+      - --lock_wait_timeout=120
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - mdl-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      - mdl-net
+
+  php:
+    image: php:8.2-cli
+    container_name: mdl-php
+    working_dir: /app
+    command: >
+      bash -c "docker-php-ext-install -j$$(nproc) pdo pdo_mysql >/dev/null
+      && tail -f /dev/null"
+    volumes:
+      - ./php:/app:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: mdl_demo
+      DB_USER: demo
+      DB_PASS: demopw
+    networks:
+      - mdl-net
+
+networks:
+  mdl-net:
+    driver: bridge
+
+volumes:
+  mdl-mysql-data:
