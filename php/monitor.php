@@ -4,15 +4,25 @@ declare(strict_types=1);
 require __DIR__ . '/db.php';
 
 /**
- * Polls performance_schema.metadata_locks and sys.schema_table_lock_waits once per second
- * and prints a digestible view of the MDL queue on `sensor_data`.
+ * Polls performance_schema.metadata_locks once per second and prints a
+ * color-coded view of the MDL queue on `sensor_data`. Designed for live demos
+ * of metadata locks and the MDL convoy.
  *
  * Usage:
- *   php monitor.php [interval_seconds=1] [table=sensor_data]
+ *   php monitor.php [interval_seconds=1] [table=sensor_data] [--no-color]
  */
 
-$interval = isset($argv[1]) ? max(1, (int)$argv[1]) : 1;
-$table    = $argv[2] ?? 'sensor_data';
+$args = $argv;
+array_shift($args);
+$useColor = stream_isatty(STDOUT);
+foreach ($args as $i => $a) {
+    if ($a === '--no-color') { $useColor = false; unset($args[$i]); }
+    if ($a === '--color')    { $useColor = true;  unset($args[$i]); }
+}
+$args = array_values($args);
+
+$interval = isset($args[0]) ? max(1, (int)$args[0]) : 1;
+$table    = $args[1] ?? 'sensor_data';
 
 $pdo = db_connect();
 
@@ -39,87 +49,202 @@ SELECT  mdl.OBJECT_SCHEMA   AS db,
  ORDER BY (mdl.LOCK_STATUS = 'GRANTED') DESC, mdl.OWNER_THREAD_ID
 SQL;
 
-// Derive wait edges directly from performance_schema.metadata_locks so we don't
-// depend on `sys.schema_table_lock_waits` (whose definer-rights checks fail for
-// non-root users). For each PENDING request we list every GRANTED holder on the
-// same table — a superset of the true wait graph that's accurate enough for the
-// convoy demo.
-$waitsSql = <<<SQL
-SELECT  pt.PROCESSLIST_ID                            AS waiter_conn,
-        SUBSTRING(pt.PROCESSLIST_INFO, 1, 80)        AS waiter_sql,
-        gt.PROCESSLIST_ID                            AS blocker_conn,
-        SUBSTRING(gt.PROCESSLIST_INFO, 1, 80)        AS blocker_sql,
-        p.LOCK_TYPE                                  AS waiter_lock,
-        g.LOCK_TYPE                                  AS blocker_lock
-  FROM  performance_schema.metadata_locks p
-  JOIN  performance_schema.threads pt ON pt.THREAD_ID = p.OWNER_THREAD_ID
-  JOIN  performance_schema.metadata_locks g
-        ON g.OBJECT_TYPE     = p.OBJECT_TYPE
-       AND g.OBJECT_SCHEMA   = p.OBJECT_SCHEMA
-       AND g.OBJECT_NAME     = p.OBJECT_NAME
-       AND g.LOCK_STATUS     = 'GRANTED'
-       AND g.OWNER_THREAD_ID <> p.OWNER_THREAD_ID
-  JOIN  performance_schema.threads gt ON gt.THREAD_ID = g.OWNER_THREAD_ID
- WHERE  p.OBJECT_TYPE   = 'TABLE'
-   AND  p.OBJECT_SCHEMA = DATABASE()
-   AND  p.OBJECT_NAME   = :tbl
-   AND  p.LOCK_STATUS   = 'PENDING'
- ORDER BY pt.PROCESSLIST_ID, gt.PROCESSLIST_ID
-SQL;
-
 $locks = $pdo->prepare($locksSql);
-$waits = $pdo->prepare($waitsSql);
+
+print_legend($useColor);
 
 $tick = 0;
 while (true) {
     $tick++;
     $locks->execute([':tbl' => $table]);
     $lockRows = $locks->fetchAll();
+    $waitRows = derive_wait_edges($lockRows);
 
-    $waits->execute([':tbl' => $table]);
-    $waitRows = $waits->fetchAll();
-
-    print_block($tick, $lockRows, $waitRows);
+    print_block($tick, $lockRows, $waitRows, $useColor);
     sleep($interval);
 }
 
-function print_block(int $tick, array $locks, array $waits): void {
-    $bar = str_repeat('=', 96);
-    echo "\n{$bar}\n";
-    printf("[%s] tick #%d -- %d MDL row(s), %d wait edge(s)\n", ts(), $tick, count($locks), count($waits));
-    echo $bar . "\n";
+/**
+ * Derive a single best blocker per PENDING request from the MDL snapshot.
+ *
+ * Workaround: MySQL does not expose the true MDL wait-for graph. Use:
+ *   1. OWNER_THREAD_ID as a proxy for arrival order (monotonic-ish).
+ *   2. Documented MDL compatibility matrix.
+ *   3. Barrier rule: a PENDING request that cannot be granted blocks every
+ *      later arrival, even ones compatible with the current holder.
+ *
+ * For each PENDING waiter, pick the earliest (lowest THREAD_ID) row that:
+ *   - is GRANTED and incompatible with waiter's lock_type, OR
+ *   - is PENDING, arrived before waiter, and is itself incompatible with
+ *     waiter's lock_type (the barrier — typically a pending EXCLUSIVE).
+ */
+function derive_wait_edges(array $rows): array {
+    $sorted = $rows;
+    usort($sorted, fn($a, $b) => (int)$a['thr'] <=> (int)$b['thr']);
+
+    $edges = [];
+    foreach ($sorted as $w) {
+        if (($w['status'] ?? '') !== 'PENDING') continue;
+        $waiterThr = (int)$w['thr'];
+        $waiterLock = (string)$w['lock_type'];
+
+        $best = null;
+        foreach ($sorted as $b) {
+            $bThr = (int)$b['thr'];
+            if ($bThr === $waiterThr) continue;
+            $bStatus = (string)$b['status'];
+            $bLock   = (string)$b['lock_type'];
+            if ($bStatus === 'GRANTED') {
+                if (!mdl_compatible($bLock, $waiterLock)) {
+                    $best = $b; break; // direct holder conflict — definitive
+                }
+            } elseif ($bStatus === 'PENDING' && $bThr < $waiterThr) {
+                if (!mdl_compatible($bLock, $waiterLock)) {
+                    if ($best === null) $best = $b; // barrier — keep looking for direct holder
+                }
+            }
+        }
+        if ($best !== null) {
+            $edges[] = [
+                'waiter_conn'  => $w['conn_id'],
+                'waiter_lock'  => $waiterLock,
+                'waiter_sql'   => $w['sql_preview'],
+                'blocker_conn' => $best['conn_id'],
+                'blocker_lock' => $best['lock_type'],
+                'blocker_kind' => $best['status'] === 'GRANTED' ? 'holder' : 'barrier',
+            ];
+        }
+    }
+    return $edges;
+}
+
+/**
+ * MDL compatibility (symmetric). True if both lock types can coexist.
+ * Reference: sql/mdl.cc — m_granted_incompatible.
+ */
+function mdl_compatible(string $a, string $b): bool {
+    static $incompat = [
+        'EXCLUSIVE'            => ['*'],
+        'SHARED_NO_READ_WRITE' => ['SHARED', 'SHARED_READ', 'SHARED_WRITE', 'SHARED_UPGRADABLE',
+                                   'SHARED_NO_WRITE', 'SHARED_NO_READ_WRITE', 'INTENTION_EXCLUSIVE'],
+        'SHARED_NO_WRITE'      => ['SHARED_WRITE', 'SHARED_NO_WRITE', 'SHARED_NO_READ_WRITE', 'INTENTION_EXCLUSIVE'],
+        'SHARED_UPGRADABLE'    => ['SHARED_UPGRADABLE'],
+    ];
+    foreach ([[$a, $b], [$b, $a]] as [$x, $y]) {
+        $row = $incompat[$x] ?? null;
+        if ($row === null) continue;
+        if ($row === ['*'] || in_array($y, $row, true)) return false;
+    }
+    return true;
+}
+
+// ---------- color helpers ----------
+
+function ansi(string $code, string $s, bool $on): string {
+    return $on ? "\033[{$code}m{$s}\033[0m" : $s;
+}
+
+/**
+ * Map MDL lock_type -> ANSI color code.
+ *  - SHARED_READ family   : cyan        (concurrent readers, compatible)
+ *  - SHARED_WRITE family  : green       (DML writers, compatible w/ each other)
+ *  - SHARED_UPGRADABLE    : yellow      (DDL prep, will upgrade to EXCLUSIVE)
+ *  - SHARED_NO_*          : magenta     (DDL intermediates)
+ *  - EXCLUSIVE            : bold red    (DDL final phase — blocks everything)
+ *  - INTENTION_EXCLUSIVE  : blue        (schema-level intent)
+ */
+function lock_color(string $lock): string {
+    return match (true) {
+        $lock === 'EXCLUSIVE'                         => '1;31', // bold red
+        $lock === 'SHARED_UPGRADABLE'                 => '33',   // yellow
+        str_starts_with($lock, 'SHARED_NO_')          => '35',   // magenta
+        $lock === 'SHARED_READ' || $lock === 'SHARED' => '36',   // cyan
+        $lock === 'SHARED_WRITE'                      => '32',   // green
+        $lock === 'INTENTION_EXCLUSIVE'               => '34',   // blue
+        default                                       => '37',   // white
+    };
+}
+
+function color_lock(string $lock, bool $on): string {
+    return ansi(lock_color($lock), str_pad($lock, 20), $on);
+}
+
+function color_status(string $status, bool $on): string {
+    $code = $status === 'GRANTED' ? '1;32' : '1;31';
+    return ansi($code, str_pad($status, 7), $on);
+}
+
+function color_marker(string $status, bool $on): string {
+    return $status === 'GRANTED'
+        ? ansi('1;32', ' [HOLDS]', $on)
+        : ansi('1;31', ' [WAITS]', $on);
+}
+
+function print_legend(bool $on): void {
+    echo "\n" . ansi('1', 'LEGEND — MDL lock types:', $on) . "\n";
+    $types = [
+        'SHARED_READ'         => 'SELECT readers (compatible)',
+        'SHARED_WRITE'        => 'DML writers: INSERT/UPDATE/DELETE',
+        'SHARED_UPGRADABLE'   => 'DDL prep — will upgrade to EXCLUSIVE',
+        'SHARED_NO_WRITE'     => 'DDL intermediate (online ALTER)',
+        'EXCLUSIVE'           => 'DDL final — blocks ALL access',
+        'INTENTION_EXCLUSIVE' => 'schema-level intent',
+    ];
+    foreach ($types as $t => $desc) {
+        printf("  %s  %s\n", color_lock($t, $on), $desc);
+    }
+    echo "  " . ansi('1;32', 'GRANTED', $on) . " = holding the lock   "
+       . ansi('1;31', 'PENDING', $on) . " = waiting in queue (convoy!)\n";
+}
+
+// ---------- main render ----------
+
+function print_block(int $tick, array $locks, array $waits, bool $on): void {
+    $bar = str_repeat('=', 110);
+    echo "\n" . ansi('1;36', $bar, $on) . "\n";
+    printf("%s tick #%d -- %s MDL row(s), %s wait edge(s)\n",
+        ansi('1', '[' . ts() . ']', $on),
+        $tick,
+        ansi('1', (string)count($locks), $on),
+        ansi('1;31', (string)count($waits), $on));
+    echo ansi('1;36', $bar, $on) . "\n";
 
     if (!$locks) {
-        echo "(no metadata locks on this table)\n";
+        echo ansi('2', "(no metadata locks on this table)\n", $on);
     } else {
-        printf("%-8s %-6s %-22s %-12s %-9s %-7s %-22s  %s\n",
+        printf("%-6s %-6s %-20s %-12s %-7s %-8s %-22s  %s\n",
             'CONN', 'THR', 'LOCK_TYPE', 'DURATION', 'STATUS', 'USER', 'STATE', 'SQL');
-        echo str_repeat('-', 96) . "\n";
+        echo str_repeat('-', 110) . "\n";
         foreach ($locks as $r) {
-            $marker = $r['status'] === 'GRANTED' ? ' [HOLDS]' : ' [WAITS]';
-            printf("%-8s %-6s %-22s %-12s %-9s %-7s %-22s  %s%s\n",
+            $status   = (string)($r['status'] ?? '?');
+            $lockType = (string)($r['lock_type'] ?? '?');
+            printf("%-6s %-6s %s %-12s %s %-8s %-22s  %s%s\n",
                 $r['conn_id'] ?? '?',
                 $r['thr'] ?? '?',
-                $r['lock_type'] ?? '?',
+                color_lock($lockType, $on),
                 $r['duration'] ?? '?',
-                $r['status'] ?? '?',
+                color_status($status, $on),
                 $r['user'] ?? '?',
                 substr((string)($r['state'] ?? ''), 0, 22),
                 $r['sql_preview'] ?? '',
-                $marker
+                color_marker($status, $on)
             );
         }
     }
 
     if ($waits) {
-        echo "\nWAIT EDGES (derived from performance_schema.metadata_locks):\n";
+        echo "\n" . ansi('1;31', 'WAIT EDGES (convoy graph):', $on) . "\n";
         foreach ($waits as $w) {
-            printf("  conn %s [%s]  <--blocked-by--  conn %s [%s]   (waiter: %s)\n",
-                $w['waiter_conn']  ?? '?',
-                $w['waiter_lock']  ?? '?',
-                $w['blocker_conn'] ?? '?',
-                $w['blocker_lock'] ?? '?',
-                substr((string)($w['waiter_sql'] ?? ''), 0, 70));
+            $kind = $w['blocker_kind'] === 'barrier'
+                ? ansi('1;33', 'queued behind BARRIER', $on)
+                : ansi('1;31', 'blocked-by HOLDER    ', $on);
+            printf("  conn %s [%s]  <--%s--  conn %s [%s]\n      waiter SQL: %s\n",
+                ansi('1;31', (string)($w['waiter_conn']  ?? '?'), $on),
+                color_lock((string)($w['waiter_lock']  ?? '?'), $on),
+                $kind,
+                ansi('1;32', (string)($w['blocker_conn'] ?? '?'), $on),
+                color_lock((string)($w['blocker_lock'] ?? '?'), $on),
+                ansi('2', substr((string)($w['waiter_sql'] ?? ''), 0, 80), $on));
         }
     }
 }
